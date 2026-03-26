@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: pokebox-solver
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn pokebox_solver:app --worker-class gevent --workers 1 --bind 0.0.0.0:$PORT
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
