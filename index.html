@@ -597,6 +597,12 @@ select option { background: var(--panel); }
           <div class="stat-box"><span class="val" id="pool-size">—</span><span class="lbl">Pool</span></div>
           <div class="stat-box"><span class="val" id="elapsed">0s</span><span class="lbl">Time</span></div>
         </div>
+        <div class="stat-row" id="metrics-row" style="display:none">
+          <div class="stat-box"><span class="val" id="seeds-eval">0</span><span class="lbl">Evaluated</span></div>
+          <div class="stat-box"><span class="val" id="cache-hit">0%</span><span class="lbl">Cache Hit</span></div>
+          <div class="stat-box"><span class="val" id="pruned-cnt">0</span><span class="lbl">Pruned</span></div>
+          <div class="stat-box"><span class="val" id="stagnant-cnt">0</span><span class="lbl">Stagnant</span></div>
+        </div>
         <div class="bar-track"><div id="bar"></div></div>
         <div class="sparkline-wrap">
           <svg id="sparkline" viewBox="0 0 300 50" preserveAspectRatio="none">
@@ -634,6 +640,12 @@ select option { background: var(--panel); }
 </div>
 
 <script src="data.js"></script>
+<script src="seedcache.js"></script>
+<script src="appealcache.js"></script>
+<script src="appealsearch.js"></script>
+<script src="symmetry.js"></script>
+<script src="heuristics.js"></script>
+<script src="mcts.js"></script>
 <script>
 
 // ── Field Definitions ──────────────────────────────────────────────────────
@@ -739,6 +751,18 @@ function fitnessScore(team, targets) {
     const p = DB[token];
     if (!p) continue;
 
+    // Use per-Pokémon appeal cache when available (avoids recomputing effects)
+    if (typeof _appealCache !== 'undefined' && _appealCache) {
+      const cached = _appealCache.getTokenContribution(token, targets);
+      if (cached !== null) {
+        score += cached.contrib;
+        for (const t of cached.coveredTypes) {
+          typeCoverage[t] = (typeCoverage[t] || 0) + 1;
+        }
+        continue;
+      }
+    }
+
     const effects = p.se || [];
 
     // repelAllVisitors → heavy penalty
@@ -815,6 +839,19 @@ let gaRunning     = false;
 let gaGen         = 0;
 let gaStopped     = false;
 let gaState       = null; // { islands, bestTeam, bestScore, maxGens, pool, targets, teamSize, popSize, numIslands }
+
+// ── Optimization objects (created fresh each run) ─────────────────────────
+let _seedCache    = null; // SeedEvaluationCache  – caches full team scores
+let _appealCache  = null; // AppealEffectsCache   – caches per-Pokémon contributions
+let _pruner       = null; // AppealPruner         – skips duplicate appeal vectors
+let _symCache     = null; // SymmetryCache        – skips order-equivalent teams
+
+// ── Run-level metrics ─────────────────────────────────────────────────────
+let _metrics = {
+  seedsEvaluated: 0, // full fitnessScore calls made
+  pruned:         0, // seeds skipped by appeal pruner
+  stagnantGens:   0, // consecutive gens with no improvement
+};
 
 // ── Init UI ────────────────────────────────────────────────────────────────
 // ── localStorage helpers ───────────────────────────────────────────────────
@@ -935,9 +972,17 @@ function startSolve() {
   gaRunning    = true;
   gaStopped    = false;
 
+  // Initialise / reset optimisation objects
+  _seedCache   = new SeedEvaluationCache();
+  _appealCache = new AppealEffectsCache();
+  _pruner      = new AppealPruner();
+  _symCache    = new SymmetryCache();
+  _metrics     = { seedsEvaluated: 0, pruned: 0, stagnantGens: 0 };
+
   document.getElementById('idle-hint').style.display    = 'none';
   document.getElementById('progress-section').style.display = 'block';
   document.getElementById('results-section').style.display  = 'none';
+  document.getElementById('metrics-row').style.display      = 'grid';
   document.getElementById('log').innerHTML = '';
   document.getElementById('runBtn').disabled = true;
   document.getElementById('stopBtn').disabled = false;
@@ -946,6 +991,10 @@ function startSolve() {
   document.getElementById('gen-num').textContent    = '0';
   document.getElementById('best-score').textContent = '—';
   document.getElementById('elapsed').textContent    = '0s';
+  document.getElementById('seeds-eval').textContent = '0';
+  document.getElementById('cache-hit').textContent  = '0%';
+  document.getElementById('pruned-cnt').textContent = '0';
+  document.getElementById('stagnant-cnt').textContent = '0';
   document.getElementById('sparkline-line').setAttribute('points', '');
   document.getElementById('sparkline-area').setAttribute('points', '');
 
@@ -971,7 +1020,8 @@ function startSolve() {
   const islands = Array.from({length: numIslands}, () =>
     Array.from({length: popSize}, () => sampleWithout(pool, teamSize))
   );
-  gaState = { islands, bestTeam: null, bestScore: -Infinity, maxGens, pool, targets, teamSize, popSize, numIslands };
+  gaState = { islands, bestTeam: null, bestScore: -Infinity, maxGens, pool, targets, teamSize, popSize, numIslands,
+              prevBestScore: -Infinity };
 
   startTime = Date.now();
   timerID = setInterval(() => {
@@ -985,6 +1035,51 @@ function startSolve() {
 
 const CHUNK_SIZE = 5; // generations per chunk before yielding to UI
 
+// Number of generations without improvement before declaring early stop.
+const STAGNATION_LIMIT = 25;
+// MCTS iterations run on the best seed at the end of each GA chunk.
+const MCTS_ITERATIONS  = 30;
+
+function _evaluateSeed(team, targets) {
+  // 1. Symmetry / order-invariant cache: skip if exact team evaluated before.
+  if (_symCache) {
+    const cached = _symCache.get(team);
+    if (cached !== undefined) return cached;
+  }
+
+  // 2. Appeal-space pruning: skip teams with a type distribution seen before.
+  if (_pruner) {
+    const sig = _pruner.getAppealSignature(team);
+    if (_pruner.seenAppealVectors.has(sig)) {
+      _metrics.pruned++;
+      // Return representative seed's score when cached, otherwise evaluate.
+      const rep = _pruner.seenAppealVectors.get(sig);
+      if (rep && _symCache) {
+        const repScore = _symCache.get(rep);
+        if (repScore !== undefined) return repScore;
+      }
+      // Representative not cached yet – fall through to evaluate this team.
+    } else {
+      _pruner.seenAppealVectors.set(sig, team);
+    }
+  }
+
+  // 3. Heuristic pre-filter: skip obviously bad seeds without full evaluation.
+  if (typeAffinityScore(team, targets) < HEURISTIC_THRESHOLD) {
+    // Cache the rejection so the same team is skipped instantly on re-encounter.
+    const penaltyScore = -Infinity;
+    if (_symCache) _symCache.set(team, penaltyScore);
+    return penaltyScore;
+  }
+
+  // 4. Full evaluation (uses _appealCache internally via fitnessScore).
+  _metrics.seedsEvaluated++;
+  const score = fitnessScore(team, targets);
+  if (_symCache) _symCache.set(team, score);
+  if (_seedCache) _seedCache.set(team, score);
+  return score;
+}
+
 function runGAChunk() {
   if (gaStopped) return;
   const { islands, pool, targets, teamSize, popSize, numIslands, maxGens } = gaState;
@@ -996,7 +1091,7 @@ function runGAChunk() {
 
     for (let idx = 0; idx < numIslands; idx++) {
       const pop    = islands[idx];
-      const scores = pop.map(t => fitnessScore(t, targets));
+      const scores = pop.map(t => _evaluateSeed(t, targets));
 
       // Track best
       let bestIdx = 0;
@@ -1031,7 +1126,31 @@ function runGAChunk() {
     }
   }
 
-  // Update UI
+  // ── MCTS refinement of the current best seed ────────────────────────────
+  if (gaState.bestTeam && pool.length > teamSize) {
+    // Pass _evaluateSeed so MCTS shares the same caching/pruning pipeline.
+    const mcts     = new SeedMCTS(gaState.bestTeam, targets, pool,
+                                   (seed) => _evaluateSeed(seed, targets));
+    const improved  = mcts.search(MCTS_ITERATIONS);
+    const mctsScore = _evaluateSeed(improved, targets);
+    if (Number.isFinite(mctsScore) && mctsScore > gaState.bestScore) {
+      gaState.bestScore = mctsScore;
+      gaState.bestTeam  = improved;
+    }
+  }
+
+  // ── Early-stopping: stagnation detection ────────────────────────────────
+  if (gaState.bestScore > gaState.prevBestScore) {
+    // Genuine improvement this chunk – reset stagnation counter.
+    _metrics.stagnantGens = 0;
+    gaState.prevBestScore = gaState.bestScore;
+  } else {
+    // No improvement – increment stagnation counter.
+    _metrics.stagnantGens++;
+  }
+  const earlyStop = _metrics.stagnantGens >= STAGNATION_LIMIT;
+
+  // ── Update UI ────────────────────────────────────────────────────────────
   const pct = Math.round((gaGen / maxGens) * 100);
   document.getElementById('bar').style.width        = pct + '%';
   document.getElementById('gen-num').textContent    = gaGen;
@@ -1039,7 +1158,22 @@ function runGAChunk() {
   scoreHistory.push(gaState.bestScore);
   updateSparkline();
 
-  if (gaGen < maxGens) {
+  // Metrics row
+  document.getElementById('seeds-eval').textContent = _metrics.seedsEvaluated;
+  const totalCacheQueries = (_symCache ? _symCache.total : 0);
+  const totalCacheHits    = (_symCache ? _symCache.hits  : 0);
+  const hitPct = totalCacheQueries > 0
+    ? Math.round((totalCacheHits / totalCacheQueries) * 100) + '%'
+    : '0%';
+  document.getElementById('cache-hit').textContent     = hitPct;
+  document.getElementById('pruned-cnt').textContent    = _metrics.pruned;
+  document.getElementById('stagnant-cnt').textContent  = _metrics.stagnantGens;
+
+  if (earlyStop) {
+    addLog(`⚡ Early stop at gen ${gaGen}: no improvement for ${STAGNATION_LIMIT} generations.`, 'warn');
+    addLog(`✓ Complete! Best fitness: ${gaState.bestScore.toFixed(2)}`, 'good');
+    finishSolve(gaState.bestTeam, gaState.bestScore, gaState.targets);
+  } else if (gaGen < maxGens) {
     gaWorkerTimer = setTimeout(runGAChunk, 0);
   } else {
     addLog(`✓ Complete! Best fitness: ${gaState.bestScore.toFixed(2)}`, 'good');
