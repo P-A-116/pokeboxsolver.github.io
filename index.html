@@ -510,6 +510,28 @@ select option { background: var(--panel); }
   flex-shrink: 0;
 }
 
+/* ── Score breakdown ── */
+.score-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+}
+.score-breakdown .sb-item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px 8px;
+}
+.score-breakdown .sb-item span {
+  color: var(--accent2);
+  font-family: var(--font-ui);
+}
+.muted { color: var(--muted); }
+
 /* ── Empty / idle state ── */
 .idle-hint {
   padding: 40px 20px;
@@ -623,6 +645,7 @@ select option { background: var(--panel); }
       <div id="results-section" class="panel">
         <div class="panel-title">Best Team</div>
         <div id="final-score"></div>
+        <div id="score-breakdown" class="score-breakdown"></div>
         <div class="team-grid" id="team-grid"></div>
         <div id="chart-wrap" style="display:none">
           <h3>TYPE APPEAL BREAKDOWN</h3>
@@ -646,6 +669,7 @@ select option { background: var(--panel); }
 <script src="symmetry.js"></script>
 <script src="heuristics.js"></script>
 <script src="mcts.js"></script>
+<script src="solver.js"></script>
 <script>
 
 // ── Field Definitions ──────────────────────────────────────────────────────
@@ -673,135 +697,9 @@ const FIELDS = [
 const FIELDS_INDEX = Object.fromEntries(FIELDS.map(f => [f.token, f]));
 
 // ── GA Engine ─────────────────────────────────────────────────────────────
-const DEFAULT_MUT_RATE = 0.15;
-const MIGRATION_FREQ   = 10;
-
-function adaptiveMutRate(gen, maxGens, base = DEFAULT_MUT_RATE) {
-  const t = gen / maxGens;
-  return base * (0.5 + 0.5 * (1 - t));
-}
-
-function tournamentSelect(pop, scores, k = 4) {
-  k = Math.min(k, pop.length);
-  let best = null, bestScore = -Infinity;
-  const used = new Set();
-  while (used.size < k) {
-    const i = Math.floor(Math.random() * pop.length);
-    if (used.has(i)) continue;
-    used.add(i);
-    if (scores[i] > bestScore) { bestScore = scores[i]; best = pop[i]; }
-  }
-  return best;
-}
-
-function crossover(a, b, pool) {
-  const cut = 1 + Math.floor(Math.random() * (a.length - 1));
-  const headSet = new Set(a.slice(0, cut));
-  const child = [...a.slice(0, cut)];
-  for (const g of b) if (!headSet.has(g)) child.push(g);
-  if (child.length < a.length) {
-    const childSet = new Set(child);
-    const remaining = pool.filter(g => !childSet.has(g));
-    shuffle(remaining);
-    child.push(...remaining.slice(0, a.length - child.length));
-  }
-  return child.slice(0, a.length);
-}
-
-function mutate(team, pool, rate) {
-  team = [...team];
-  let teamSet = new Set(team);  // O(1) membership checks
-  for (let i = 0; i < team.length; i++) {
-    if (Math.random() < rate) {
-      const candidates = pool.filter(g => !teamSet.has(g));
-      if (candidates.length) {
-        teamSet.delete(team[i]);
-        team[i] = candidates[Math.floor(Math.random() * candidates.length)];
-        teamSet.add(team[i]);
-      }
-    }
-  }
-  return team;
-}
-
-function shuffle(arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
-function sampleWithout(pool, n) {
-  const copy = [...pool]; shuffle(copy);
-  return copy.slice(0, Math.min(n, copy.length));
-}
-
-// ── Fitness Function ───────────────────────────────────────────────────────
-// Score a team against field base types.
-// Each Pokémon contributes for each of its types that matches a target type.
-// Diversity bonus: penalise repeated type coverage.
-// Species effects applied: ignoreTypeWeaknesses, reverseTypeAppeal, repelAllVisitors, increaseSpecialVisitors
-function fitnessScore(team, targets) {
-  const targetSet = new Set(targets);
-  let score = 0;
-  const typeCoverage = {};
-
-  for (const token of team) {
-    const p = DB[token];
-    if (!p) continue;
-
-    // Use per-Pokémon appeal cache when available (avoids recomputing effects)
-    if (typeof _appealCache !== 'undefined' && _appealCache) {
-      const cached = _appealCache.getTokenContribution(token, targets);
-      if (cached !== null) {
-        score += cached.contrib;
-        for (const t of cached.coveredTypes) {
-          typeCoverage[t] = (typeCoverage[t] || 0) + 1;
-        }
-        continue;
-      }
-    }
-
-    const effects = p.se || [];
-
-    // repelAllVisitors → heavy penalty
-    if (effects.includes('repelAllVisitors')) { score -= 5; continue; }
-
-    // life_points override
-    if (p.lp === -1) { score -= 3; continue; }  // infinite drain
-    if (p.lp !== null && p.lp !== undefined) { score += p.lp / 100; }
-
-    const types = p.t || [];
-    let contrib = 0;
-
-    if (effects.includes('reverseTypeAppeal')) {
-      // contributes for types NOT in targets
-      for (const t of types) {
-        if (!targetSet.has(t)) contrib += 1;
-      }
-    } else {
-      for (const t of types) {
-        if (targetSet.has(t)) {
-          contrib += 1;
-          typeCoverage[t] = (typeCoverage[t] || 0) + 1;
-        }
-      }
-    }
-
-    if (effects.includes('increaseSpecialVisitors')) contrib *= 1.5;
-    score += contrib;
-  }
-
-  // Diversity bonus: reward spreading coverage across target types
-  let diversityBonus = 0;
-  for (const t of targets) {
-    if (typeCoverage[t]) diversityBonus += Math.min(typeCoverage[t], 2) * 0.3;
-  }
-  score += diversityBonus;
-
-  return score;
-}
+// Core GA operations (tournamentSelect, crossover, mutate, etc.) and the
+// multi-phase FitnessEvaluator are defined in solver.js.
+// GA_CONFIG holds all tuneable constants.
 
 // ── Appeal Chart Data ──────────────────────────────────────────────────────
 function appealChartData(team, targets) {
@@ -845,13 +743,8 @@ let _seedCache    = null; // SeedEvaluationCache  – caches full team scores
 let _appealCache  = null; // AppealEffectsCache   – caches per-Pokémon contributions
 let _pruner       = null; // AppealPruner         – skips duplicate appeal vectors
 let _symCache     = null; // SymmetryCache        – skips order-equivalent teams
-
-// ── Run-level metrics ─────────────────────────────────────────────────────
-let _metrics = {
-  seedsEvaluated: 0, // full fitnessScore calls made
-  pruned:         0, // seeds skipped by appeal pruner
-  stagnantGens:   0, // consecutive gens with no improvement
-};
+let _gaEngine     = null; // GeneticAlgorithmEngine – GA operations
+let _pipeline     = null; // HybridSearchPipeline – evaluation + search orchestration
 
 // ── Init UI ────────────────────────────────────────────────────────────────
 // ── localStorage helpers ───────────────────────────────────────────────────
@@ -977,7 +870,6 @@ function startSolve() {
   _appealCache = new AppealEffectsCache();
   _pruner      = new AppealPruner();
   _symCache    = new SymmetryCache();
-  _metrics     = { seedsEvaluated: 0, pruned: 0, stagnantGens: 0 };
 
   document.getElementById('idle-hint').style.display    = 'none';
   document.getElementById('progress-section').style.display = 'block';
@@ -1014,12 +906,14 @@ function startSolve() {
     return;
   }
 
+  // Initialise GA engine and evaluation pipeline.
+  _gaEngine = new GeneticAlgorithmEngine();
+  _pipeline = new HybridSearchPipeline(targets, pool, _gaEngine);
+
   gaGen = 0;
 
-  // Init islands
-  const islands = Array.from({length: numIslands}, () =>
-    Array.from({length: popSize}, () => sampleWithout(pool, teamSize))
-  );
+  // Init islands with canonical deduplication via _gaEngine.
+  const islands = _gaEngine.initIslands(pool, popSize, teamSize, numIslands);
   gaState = { islands, bestTeam: null, bestScore: -Infinity, maxGens, pool, targets, teamSize, popSize, numIslands,
               prevBestScore: -Infinity };
 
@@ -1033,67 +927,31 @@ function startSolve() {
   runGAChunk();
 }
 
-const CHUNK_SIZE = 5; // generations per chunk before yielding to UI
+const CHUNK_SIZE = GA_CONFIG.CHUNK_SIZE;
 
 // Number of generations without improvement before declaring early stop.
-const STAGNATION_LIMIT = 25;
+const STAGNATION_LIMIT = GA_CONFIG.STAGNATION_LIMIT;
 // MCTS iterations run on the best seed at the end of each GA chunk.
-const MCTS_ITERATIONS  = 30;
+const MCTS_ITERATIONS  = GA_CONFIG.MCTS_ITERATIONS;
 
-function _evaluateSeed(team, targets) {
-  // 1. Symmetry / order-invariant cache: skip if exact team evaluated before.
-  if (_symCache) {
-    const cached = _symCache.get(team);
-    if (cached !== undefined) return cached;
-  }
-
-  // 2. Appeal-space pruning: skip teams with a type distribution seen before.
-  if (_pruner) {
-    const sig = _pruner.getAppealSignature(team);
-    if (_pruner.seenAppealVectors.has(sig)) {
-      _metrics.pruned++;
-      // Return representative seed's score when cached, otherwise evaluate.
-      const rep = _pruner.seenAppealVectors.get(sig);
-      if (rep && _symCache) {
-        const repScore = _symCache.get(rep);
-        if (repScore !== undefined) return repScore;
-      }
-      // Representative not cached yet – fall through to evaluate this team.
-    } else {
-      _pruner.seenAppealVectors.set(sig, team);
-    }
-  }
-
-  // 3. Heuristic pre-filter: skip obviously bad seeds without full evaluation.
-  if (typeAffinityScore(team, targets) < HEURISTIC_THRESHOLD) {
-    // Cache the rejection so the same team is skipped instantly on re-encounter.
-    const penaltyScore = -Infinity;
-    if (_symCache) _symCache.set(team, penaltyScore);
-    return penaltyScore;
-  }
-
-  // 4. Full evaluation (uses _appealCache internally via fitnessScore).
-  _metrics.seedsEvaluated++;
-  const score = fitnessScore(team, targets);
-  if (_symCache) _symCache.set(team, score);
-  if (_seedCache) _seedCache.set(team, score);
-  return score;
+function _evaluateSeed(team) {
+  return _pipeline.evaluateSeed(team);
 }
 
 function runGAChunk() {
   if (gaStopped) return;
   const { islands, pool, targets, teamSize, popSize, numIslands, maxGens } = gaState;
-  const chunkEnd = Math.min(gaGen + CHUNK_SIZE, maxGens);
+  const chunkEnd = Math.min(gaGen + GA_CONFIG.CHUNK_SIZE, maxGens);
 
   for (; gaGen < chunkEnd; gaGen++) {
     const gen = gaGen + 1;
-    const mutRate = adaptiveMutRate(gen, maxGens);
+    const mutRate = _gaEngine.adaptiveMutRate(gen, maxGens);
 
     for (let idx = 0; idx < numIslands; idx++) {
       const pop    = islands[idx];
-      const scores = pop.map(t => _evaluateSeed(t, targets));
+      const scores = pop.map(t => _pipeline.evaluateSeed(t));
 
-      // Track best
+      // Track best across all islands.
       let bestIdx = 0;
       for (let i = 1; i < scores.length; i++) {
         if (scores[i] > scores[bestIdx]) bestIdx = i;
@@ -1103,20 +961,12 @@ function runGAChunk() {
         gaState.bestTeam  = [...pop[bestIdx]];
       }
 
-      // Next generation
-      const nextPop = [];
-      while (nextPop.length < popSize) {
-        const pa = tournamentSelect(pop, scores);
-        const pb = tournamentSelect(pop, scores);
-        let child = crossover(pa, pb, pool);
-        child = mutate(child, pool, mutRate);
-        nextPop.push(child);
-      }
-      islands[idx] = nextPop;
+      // Evolve this island for one generation.
+      islands[idx] = _gaEngine.evolveIsland(pop, scores, pool, mutRate);
     }
 
-    // Migration
-    if (gen % MIGRATION_FREQ === 0) {
+    // Migration: swap one representative between adjacent islands.
+    if (gen % GA_CONFIG.MIGRATION_FREQ === 0) {
       const migrants = islands.map(isl => isl[Math.floor(Math.random() * isl.length)]);
       for (let i = 0; i < numIslands; i++) {
         const dest = (i + 1) % numIslands;
@@ -1127,12 +977,9 @@ function runGAChunk() {
   }
 
   // ── MCTS refinement of the current best seed ────────────────────────────
-  if (gaState.bestTeam && pool.length > teamSize) {
-    // Pass _evaluateSeed so MCTS shares the same caching/pruning pipeline.
-    const mcts     = new SeedMCTS(gaState.bestTeam, targets, pool,
-                                   (seed) => _evaluateSeed(seed, targets));
-    const improved  = mcts.search(MCTS_ITERATIONS);
-    const mctsScore = _evaluateSeed(improved, targets);
+  if (gaState.bestTeam) {
+    const improved  = _pipeline.runMCTS(gaState.bestTeam, GA_CONFIG.MCTS_ITERATIONS);
+    const mctsScore = _pipeline.evaluateSeed(improved);
     if (Number.isFinite(mctsScore) && mctsScore > gaState.bestScore) {
       gaState.bestScore = mctsScore;
       gaState.bestTeam  = improved;
@@ -1141,14 +988,12 @@ function runGAChunk() {
 
   // ── Early-stopping: stagnation detection ────────────────────────────────
   if (gaState.bestScore > gaState.prevBestScore) {
-    // Genuine improvement this chunk – reset stagnation counter.
-    _metrics.stagnantGens = 0;
+    _pipeline.metrics.stagnantGens = 0;
     gaState.prevBestScore = gaState.bestScore;
   } else {
-    // No improvement – increment stagnation counter.
-    _metrics.stagnantGens++;
+    _pipeline.metrics.stagnantGens++;
   }
-  const earlyStop = _metrics.stagnantGens >= STAGNATION_LIMIT;
+  const earlyStop = _pipeline.metrics.stagnantGens >= GA_CONFIG.STAGNATION_LIMIT;
 
   // ── Update UI ────────────────────────────────────────────────────────────
   const pct = Math.round((gaGen / maxGens) * 100);
@@ -1159,18 +1004,18 @@ function runGAChunk() {
   updateSparkline();
 
   // Metrics row
-  document.getElementById('seeds-eval').textContent = _metrics.seedsEvaluated;
+  document.getElementById('seeds-eval').textContent = _pipeline.metrics.seedsEvaluated;
   const totalCacheQueries = (_symCache ? _symCache.total : 0);
   const totalCacheHits    = (_symCache ? _symCache.hits  : 0);
   const hitPct = totalCacheQueries > 0
     ? Math.round((totalCacheHits / totalCacheQueries) * 100) + '%'
     : '0%';
   document.getElementById('cache-hit').textContent     = hitPct;
-  document.getElementById('pruned-cnt').textContent    = _metrics.pruned;
-  document.getElementById('stagnant-cnt').textContent  = _metrics.stagnantGens;
+  document.getElementById('pruned-cnt').textContent    = _pipeline.metrics.pruned;
+  document.getElementById('stagnant-cnt').textContent  = _pipeline.metrics.stagnantGens;
 
   if (earlyStop) {
-    addLog(`⚡ Early stop at gen ${gaGen}: no improvement for ${STAGNATION_LIMIT} generations.`, 'warn');
+    addLog(`⚡ Early stop at gen ${gaGen}: no improvement for ${GA_CONFIG.STAGNATION_LIMIT} generations.`, 'warn');
     addLog(`✓ Complete! Best fitness: ${gaState.bestScore.toFixed(2)}`, 'good');
     finishSolve(gaState.bestTeam, gaState.bestScore, gaState.targets);
   } else if (gaGen < maxGens) {
@@ -1213,6 +1058,15 @@ function renderResults(team, score, targets) {
   document.getElementById('final-score').textContent =
     `FITNESS ${score.toFixed(2)}  //  ${team.length} POKÉMON  //  FIELD MATCH`;
 
+  // Score breakdown by phase.
+  const teamBreakdown = new FitnessEvaluator(targets).breakdown(team);
+  document.getElementById('score-breakdown').innerHTML = `
+    <div class="sb-item">Base <span>${teamBreakdown.base.toFixed(1)}</span></div>
+    <div class="sb-item">Diversity <span>+${teamBreakdown.diversity.toFixed(1)}</span></div>
+    <div class="sb-item">Rarity <span>+${teamBreakdown.rarity.toFixed(1)}</span></div>
+    <div class="sb-item">Coverage <span>+${teamBreakdown.coverage.toFixed(1)}</span></div>
+  `;
+
   const grid = document.getElementById('team-grid');
   grid.innerHTML = '';
 
@@ -1242,8 +1096,9 @@ function renderResults(team, score, targets) {
       : '';
 
     const ip = fitnessScore([token], targets);
+    const bd = new FitnessEvaluator(targets).breakdown([token]);
     const ipEl = ip > 0
-      ? `<div class="poke-score">↑ ${ip.toFixed(1)}</div>`
+      ? `<div class="poke-score">↑ ${ip.toFixed(1)}${bd.rarity > 0 ? ` <span class="muted">+${bd.rarity.toFixed(1)}★</span>` : ''}</div>`
       : `<div class="poke-score muted">—</div>`;
 
     grid.innerHTML += `
