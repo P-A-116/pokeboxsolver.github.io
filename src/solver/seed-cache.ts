@@ -1,9 +1,11 @@
+import { canonicalizeSeed } from './symmetry';
+
 export class SeedEvaluationCache {
   private cache: Map<string, number> = new Map();
   hits = 0;
   total = 0;
 
-  cacheKey(seed: string[]): string { return [...seed].sort().join(','); }
+  cacheKey(seed: string[]): string { return canonicalizeSeed(seed); }
   has(seed: string[]): boolean { return this.cache.has(this.cacheKey(seed)); }
   get(seed: string[]): number | undefined {
     this.total++;

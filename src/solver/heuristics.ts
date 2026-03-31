@@ -1,6 +1,7 @@
 import { DB } from '../data/db';
+import { GA_CONFIG } from './config';
 
-export const HEURISTIC_THRESHOLD = 0.35;
+export const HEURISTIC_THRESHOLD = GA_CONFIG.HEURISTIC_THRESHOLD;
 
 export const ATTRACTS: Record<string, string[]> = {
   fire:     ['water', 'ground'],
