@@ -48,12 +48,12 @@ function loadResults(): SavedResults | null {
 }
 
 // ── Sprite URL ──
-const MAX_SPRITE_DEX_NUMBER = 1000;
+const MAX_SUPPORTED_DEX_NUMBER = 1000;
 
 function spriteUrl(token: string): string | null {
   const p = DB[token]; if (!p) return null;
   const dex = p.d;
-  if (!dex || typeof dex !== 'number' || dex > MAX_SPRITE_DEX_NUMBER) return null;
+  if (!dex || typeof dex !== 'number' || dex > MAX_SUPPORTED_DEX_NUMBER) return null;
   return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${Math.floor(dex)}.png`;
 }
 
