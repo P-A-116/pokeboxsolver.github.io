@@ -3,6 +3,7 @@ import { FitnessEvaluator } from './fitness';
 import { GeneticAlgorithmEngine } from './ga-engine';
 import { SeedMCTS } from './mcts';
 import { typeAffinityScore } from './heuristics';
+import type { AppealEffectsCache } from './appeal-cache';
 import type { AppealPruner } from './appeal-pruner';
 import type { SymmetryCache } from './symmetry';
 import type { SeedEvaluationCache } from './seed-cache';
@@ -31,12 +32,13 @@ export class HybridSearchPipeline {
       symCache?: SymmetryCache;
       pruner?: AppealPruner;
       seedCache?: SeedEvaluationCache;
+      appealCache?: AppealEffectsCache;
     }
   ) {
     this.targets = targets;
     this.pool = pool;
     this.gaEngine = gaEngine;
-    this.evaluator = new FitnessEvaluator(targets);
+    this.evaluator = new FitnessEvaluator(targets, options?.appealCache);
     this.metrics = { seedsEvaluated: 0, pruned: 0, stagnantGens: 0 };
     this.symCache = options?.symCache;
     this.pruner = options?.pruner;
